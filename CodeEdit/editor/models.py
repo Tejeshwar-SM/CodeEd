@@ -32,6 +32,8 @@ class UserPreferences(models.Model):
     font_size = models.IntegerField(default=14)
     tab_size = models.IntegerField(default=4)
     auto_save = models.BooleanField(default=True)
+    show_minimap = models.BooleanField(default=False)
+    word_wrap = models.BooleanField(default=True)
 
     def __str__(self):
         return f"{self.user.username} Preferences"

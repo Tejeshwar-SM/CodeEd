@@ -38,4 +38,4 @@ class ProjectSerializer(serializers.ModelSerializer):
 class UserPreferencesSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserPreferences
-        fields = ['id', 'theme', 'font_size', 'tab_size', 'auto_save']
+        fields = ['id', 'theme', 'font_size', 'tab_size', 'auto_save', 'show_minimap', 'word_wrap']
