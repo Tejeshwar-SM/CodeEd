@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import Button from '../ui/Button';
-import { formatDistanceToNow } from 'date-fns';
 
 const FileExplorer = ({
   files,
@@ -42,7 +41,7 @@ const FileExplorer = ({
   };
 
   const handleRenameSubmit = (file) => {
-    if (newFileNameForRename && newFileNameForRename !== file.name) {
+    if (newFileNameForRename.trim() && newFileNameForRename !== file.name) {
       onRenameFile(file.id, newFileNameForRename);
     }
     setFileToRename(null);
@@ -144,7 +143,9 @@ const FileExplorer = ({
                           className="text-gray-500 hover:text-gray-700 text-xs"
                           onClick={(e) => {
                             e.stopPropagation();
-                            onDeleteFile(file.id);
+                            if (confirm(`Are you sure you want to delete ${file.name}?`)) {
+                              onDeleteFile(file.id);
+                            }
                           }}
                           title="Delete file"
                         >

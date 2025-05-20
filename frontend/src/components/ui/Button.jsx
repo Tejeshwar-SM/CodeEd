@@ -34,7 +34,7 @@ const Button = ({
 
   return (
     <button
-      type={type}
+      type={type} // This is correctly passing the type
       className={classes}
       onClick={onClick}
       disabled={disabled}

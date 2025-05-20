@@ -1,28 +1,39 @@
 import { createContext, useState, useEffect } from 'react';
-import api, { auth } from '../services/api';
+import { auth as authApi } from '../services/api';
 
-export const AuthContext = createContext();
+export const AuthContext = createContext({
+  isAuthenticated: false,
+  user: null,
+  loading: false,
+  error: null,
+  initialLoadComplete: false,
+  login: () => {},
+  register: () => {},
+  logout: () => {},
+});
 
 export const AuthProvider = ({ children }) => {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [initialLoadComplete, setInitialLoadComplete] = useState(false);
   const [error, setError] = useState(null);
 
-  // Check if user is already logged in
+  // Initial check for existing authentication
   useEffect(() => {
     const checkAuth = async () => {
       try {
         const token = localStorage.getItem('token');
         if (token) {
-          api.defaults.headers.common['Authorization'] = `Token ${token}`;
-          const response = await auth.me();
+          const response = await authApi.me();
           setUser(response.data);
         }
       } catch (err) {
+        // Clear token if verification fails
         localStorage.removeItem('token');
         console.error('Auth check failed:', err);
       } finally {
         setLoading(false);
+        setInitialLoadComplete(true);
       }
     };
 
@@ -30,17 +41,17 @@ export const AuthProvider = ({ children }) => {
   }, []);
 
   const login = async (credentials) => {
+    setLoading(true);
+    setError(null);
+
     try {
-      setLoading(true);
-      setError(null);
-      const response = await auth.login(credentials);
-      const { token, user_id } = response.data;
+      const response = await authApi.login(credentials);
+      const { token } = response.data;
 
       localStorage.setItem('token', token);
-      api.defaults.headers.common['Authorization'] = `Token ${token}`;
 
       // Fetch user details after login
-      const userResponse = await auth.me();
+      const userResponse = await authApi.me();
       setUser(userResponse.data);
       return true;
     } catch (err) {
@@ -52,14 +63,14 @@ export const AuthProvider = ({ children }) => {
   };
 
   const register = async (userData) => {
+    setLoading(true);
+    setError(null);
+
     try {
-      setLoading(true);
-      setError(null);
-      const response = await auth.register(userData);
+      const response = await authApi.register(userData);
       const { token, user } = response.data;
 
       localStorage.setItem('token', token);
-      api.defaults.headers.common['Authorization'] = `Token ${token}`;
       setUser(user);
       return true;
     } catch (err) {
@@ -76,22 +87,51 @@ export const AuthProvider = ({ children }) => {
   };
 
   const logout = () => {
+    // Clear token from storage
     localStorage.removeItem('token');
-    delete api.defaults.headers.common['Authorization'];
     setUser(null);
+
+    // Close any open WebSocket connections
+    const closeAllWebSockets = () => {
+      // This will find and close any open WebSocket connections
+      const openSockets = window.performance
+        .getEntriesByType("resource")
+        .filter(resource => resource.initiatorType === "other" &&
+                resource.name.includes("ws"));
+
+      openSockets.forEach(socket => {
+        try {
+          // Try to find and close the socket
+          const wsUrl = new URL(socket.name);
+          const allSockets = Array.from(document.querySelectorAll('*'))
+            .filter(el => el._socket &&
+                   el._socket.url &&
+                   el._socket.url.includes(wsUrl.pathname));
+
+          allSockets.forEach(el => {
+            if (el._socket && el._socket.close) {
+              el._socket.close();
+            }
+          });
+        } catch (e) {
+          console.error("Error closing socket", e);
+        }
+      });
+    };
+
+    closeAllWebSockets();
   };
 
-  return (
-    <AuthContext.Provider value={{
-      user,
-      loading,
-      error,
-      login,
-      register,
-      logout,
-      isAuthenticated: !!user
-    }}>
-      {children}
-    </AuthContext.Provider>
-  );
+  const value = {
+    isAuthenticated: !!user,
+    user,
+    loading,
+    error,
+    initialLoadComplete,
+    login,
+    register,
+    logout,
+  };
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 };
