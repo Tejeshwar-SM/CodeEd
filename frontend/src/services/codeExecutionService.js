@@ -1,7 +1,12 @@
+// src/services/codeExecutionService.js
+
 class CodeExecutionService {
   constructor() {
     this.socket = null;
     this.sessionId = null;
+    this.reconnectAttempts = 0;
+    this.isReconnecting = false;
+    this.maxReconnectAttempts = 3;
     this.handlers = {
       output: [],
       error: [],
@@ -14,8 +19,21 @@ class CodeExecutionService {
   }
 
   setupWebSocket() {
+    if (this.socket && this.socket.readyState === WebSocket.CONNECTING) {
+      console.log("WebSocket connection already in progress");
+      return this.socket;
+    }
+
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      console.log("WebSocket connection already open");
+      return this.socket;
+    }
+
+    // Close any existing socket
+    this.closeConnection();
+
     // Generate a unique session ID
-    this.sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    this.sessionId = `session_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     console.log("Setting up new WebSocket connection with session ID:", this.sessionId);
 
     // Create new WebSocket connection
@@ -27,13 +45,15 @@ class CodeExecutionService {
 
     this.socket.onopen = () => {
       console.log('WebSocket connection established');
+      this.reconnectAttempts = 0;
+      this.isReconnecting = false;
       // Wait for the connection_established message from the server
     };
 
     this.socket.onmessage = (event) => {
       try {
-        console.log('Received:', event.data);
         const data = JSON.parse(event.data);
+        console.log('Received:', data);
 
         switch(data.type) {
           case 'connection_established':
@@ -68,11 +88,21 @@ class CodeExecutionService {
       console.log('WebSocket connection closed', event);
 
       // Notify about unexpected closure during execution
-      this._notifyHandlers('executionTerminated', 'Connection closed unexpectedly');
-
-      // Notify about socket errors
       if (event.code !== 1000) { // 1000 is normal closure
+        this._notifyHandlers('executionTerminated', 'Connection closed unexpectedly');
         this._notifyHandlers('socketError', `Connection closed: ${event.reason || 'Unknown reason'}`);
+
+        // Only try to reconnect if it wasn't explicitly closed by our code
+        if (!this.isReconnecting && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          this.isReconnecting = true;
+          console.log(`Reconnect attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in 2 seconds...`);
+
+          setTimeout(() => {
+            this.isReconnecting = false;
+            // We don't automatically reconnect, let the user try running code again
+          }, 2000);
+        }
       }
     };
 
@@ -88,9 +118,11 @@ class CodeExecutionService {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
       this.setupWebSocket();
 
-      // We'll return a promise that resolves when the connection is established
+      // Return a promise that resolves when the connection is established
       return new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
+          this.off('connectionEstablished', connectionHandler);
+          this.off('socketError', errorHandler);
           reject(new Error("WebSocket connection timeout"));
         }, 5000);
 
@@ -98,21 +130,21 @@ class CodeExecutionService {
           clearTimeout(timeout);
           this._executeCode(code, language, fileId);
           resolve();
+
+          // Clean up event handlers after connection
+          this.off('connectionEstablished', connectionHandler);
+          this.off('socketError', errorHandler);
         };
 
         const errorHandler = (error) => {
           clearTimeout(timeout);
+          this.off('connectionEstablished', connectionHandler);
+          this.off('socketError', errorHandler);
           reject(new Error(error));
         };
 
         this.on('connectionEstablished', connectionHandler);
         this.on('socketError', errorHandler);
-
-        // Clean up event handlers after connection or error
-        setTimeout(() => {
-          this.off('connectionEstablished', connectionHandler);
-          this.off('socketError', errorHandler);
-        }, 6000);
       });
     } else {
       this._executeCode(code, language, fileId);
@@ -191,10 +223,20 @@ class CodeExecutionService {
   }
 
   closeConnection() {
-    if (this.socket && this.socket.readyState !== WebSocket.CLOSED) {
-      this.socket.close();
+    if (this.socket) {
+      if (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING) {
+        try {
+          this.socket.close(1000, "Normal closure");
+        } catch (e) {
+          console.error("Error closing WebSocket:", e);
+        }
+      }
       this.socket = null;
     }
+  }
+
+  getSessionId() {
+    return this.sessionId;
   }
 }
 

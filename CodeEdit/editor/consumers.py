@@ -1,12 +1,9 @@
 import json
 import asyncio
-import uuid
 import os
 import tempfile
-import subprocess
 import re
-import signal
-import sys
+import subprocess
 from channels.generic.websocket import AsyncWebsocketConsumer
 
 class CodeConsumer(AsyncWebsocketConsumer):
@@ -15,6 +12,7 @@ class CodeConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         self.session_id = self.scope['url_route']['kwargs']['session_id']
         await self.accept()
+        self.temp_file_name = None  # Initialize temp_file_name
 
         # Send confirmation message
         await self.send(json.dumps({
@@ -35,15 +33,21 @@ class CodeConsumer(AsyncWebsocketConsumer):
                 print(f"Error removing temp file: {e}")
 
     async def receive(self, text_data):
-        data = json.loads(text_data)
-        message_type = data.get('type')
+        try:
+            data = json.loads(text_data)
+            message_type = data.get('type')
 
-        if message_type == 'execute':
-            await self.execute_code(data)
-        elif message_type == 'input':
-            await self.send_input(data)
-        elif message_type == 'terminate':
-            await self.terminate_execution()
+            if message_type == 'execute':
+                await self.execute_code(data)
+            elif message_type == 'input':
+                await self.send_input(data)
+            elif message_type == 'terminate':
+                await self.terminate_execution()
+        except Exception as e:
+            await self.send(json.dumps({
+                'type': 'error',
+                'error': f"Error processing request: {str(e)}"
+            }))
 
     async def execute_code(self, data):
         # Clean up any previous process
@@ -53,21 +57,19 @@ class CodeConsumer(AsyncWebsocketConsumer):
         language = data.get('language', 'python').lower()
 
         # Create temp file with appropriate suffix
-        if language in ['javascript', 'js']:
-            suffix = '.js'
-            run_cmd = ['node']
-        else:  # Default to Python
-            suffix = '.py'
-            # Modify Python code to handle input better
-            # Add a wrapper that redirects stdin/stdout for better control
-            input_wrapper = """
+        try:
+            if language in ['javascript', 'js']:
+                suffix = '.js'
+                run_cmd = ['node']
+            else:  # Default to Python
+                suffix = '.py'
+                # Wrap Python code to handle input better
+                input_wrapper = """
 import sys
 import threading
-from io import StringIO
 
 class InputRedirector:
-    def __init__(self, console):
-        self.console = console
+    def __init__(self):
         self.input_ready = threading.Event()
         self.input_value = None
         
@@ -82,7 +84,7 @@ class InputRedirector:
         return value
 
 # Setup redirectors
-input_redirector = InputRedirector(sys)
+input_redirector = InputRedirector()
 original_stdin = sys.stdin
 sys.stdin = input_redirector
 
@@ -97,50 +99,62 @@ __builtins__['input'] = custom_input
 
 # Your code starts here
 """
-            code = input_wrapper + "\n\n" + code
-            run_cmd = ['python']
+                code = input_wrapper + "\n\n" + code
+                run_cmd = ['python']
 
-        # Create a temporary file
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_file.write(code.encode())
-            self.temp_file_name = temp_file.name
+            # Create a temporary file
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
+                temp_file.write(code.encode())
+                self.temp_file_name = temp_file.name
 
-        # Run the code asynchronously
-        process = await asyncio.create_subprocess_exec(
-            *run_cmd, self.temp_file_name,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            stdin=asyncio.subprocess.PIPE,
-            shell=False
-        )
+            # Run the code asynchronously
+            process = await asyncio.create_subprocess_exec(
+                *run_cmd, self.temp_file_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.PIPE,
+                shell=False
+            )
 
-        # Store process
-        self.processes[self.session_id] = process
+            # Store process
+            self.processes[self.session_id] = process
 
+            # Handle output and error streams
+            await self.handle_process_streams(process)
+
+        except Exception as e:
+            await self.send(json.dumps({
+                'type': 'error',
+                'error': f"Execution error: {str(e)}"
+            }))
+            # Clean up temp file on error
+            if hasattr(self, 'temp_file_name') and self.temp_file_name and os.path.exists(self.temp_file_name):
+                try:
+                    os.unlink(self.temp_file_name)
+                    self.temp_file_name = None
+                except:
+                    pass
+
+    async def handle_process_streams(self, process):
         # Function to handle input detection
         async def detect_input(line):
-            # For Python, look for our special marker
             if line == "__WAITING_FOR_INPUT__":
-                await self.send(json.dumps({
-                    'type': 'input_prompt',
-                }))
+                await self.send(json.dumps({'type': 'input_prompt'}))
                 return True
 
             # Other common patterns
             input_patterns = [
-                r"^input\(['\"]?(.+?)['\"]?\)",  # Check for input() calls
-                r"(?:Enter|Type|Provide|Give|Insert).+?:",  # Natural language prompts
-                r"Please .+?:",  # Please followed by a colon
-                r"\w+: $",  # Word followed by colon and space at end of line
-                r"\w+\?\s*$",  # Word followed by question mark at end of line
-                r"^>>>\s*$",  # Python prompt
+                r"^input\(['\"]?(.+?)['\"]?\)",
+                r"(?:Enter|Type|Provide|Give|Insert).+?:",
+                r"Please .+?:",
+                r"\w+: $",
+                r"\w+\?\s*$",
+                r"^>>>\s*$",
             ]
 
             for pattern in input_patterns:
                 if re.search(pattern, line):
-                    await self.send(json.dumps({
-                        'type': 'input_prompt',
-                    }))
+                    await self.send(json.dumps({'type': 'input_prompt'}))
                     return True
             return False
 
@@ -152,7 +166,7 @@ __builtins__['input'] = custom_input
                     if not line:
                         break
 
-                    line_str = line.decode('utf-8').rstrip('\n')
+                    line_str = line.decode('utf-8', errors='replace').rstrip('\n')
 
                     # Check if the line is asking for input
                     is_input = await detect_input(line_str)
@@ -175,7 +189,7 @@ __builtins__['input'] = custom_input
                     line = await process.stderr.readline()
                     if not line:
                         break
-                    line_str = line.decode('utf-8').rstrip('\n')
+                    line_str = line.decode('utf-8', errors='replace').rstrip('\n')
                     await self.send(json.dumps({
                         'type': 'error',
                         'error': line_str
@@ -188,12 +202,16 @@ __builtins__['input'] = custom_input
                     break
 
         # Start reading in the background
-        asyncio.create_task(read_stdout())
-        asyncio.create_task(read_stderr())
+        stdout_task = asyncio.create_task(read_stdout())
+        stderr_task = asyncio.create_task(read_stderr())
 
         # Wait for the process to finish
         try:
             exit_code = await process.wait()
+
+            # Wait for stdout and stderr to be fully read
+            await stdout_task
+            await stderr_task
 
             # Process complete
             if self.session_id in self.processes:
