@@ -15,10 +15,10 @@ class CodeConsumer(AsyncWebsocketConsumer):
         self.temp_file_name = None  # Initialize temp_file_name
 
         # Send confirmation message
-        await self.send(json.dumps({
+        await self._send_json_safe({
             'type': 'connection_established',
             'session_id': self.session_id
-        }))
+        })
 
     async def disconnect(self, close_code):
         # Clean up any running processes
@@ -44,10 +44,10 @@ class CodeConsumer(AsyncWebsocketConsumer):
             elif message_type == 'terminate':
                 await self.terminate_execution()
         except Exception as e:
-            await self.send(json.dumps({
+            await self._send_json_safe({
                 'type': 'error',
                 'error': f"Error processing request: {str(e)}"
-            }))
+            })
 
     async def execute_code(self, data):
         # Clean up any previous process
@@ -123,23 +123,27 @@ __builtins__['input'] = custom_input
             await self.handle_process_streams(process)
 
         except Exception as e:
-            await self.send(json.dumps({
+            await self._send_json_safe({
                 'type': 'error',
                 'error': f"Execution error: {str(e)}"
-            }))
+            })
             # Clean up temp file on error
-            if hasattr(self, 'temp_file_name') and self.temp_file_name and os.path.exists(self.temp_file_name):
-                try:
-                    os.unlink(self.temp_file_name)
-                    self.temp_file_name = None
-                except:
-                    pass
+            if hasattr(self, 'temp_file_name') and self.temp_file_name:
+                if os.path.exists(self.temp_file_name):
+                    try:
+                        os.unlink(self.temp_file_name)
+                        print(f"CodeConsumer: Successfully unlinked temp file {self.temp_file_name} after error.")
+                    except OSError as unlink_e:
+                        print(f"CodeConsumer: Error unlinking temp file {self.temp_file_name} after error: {unlink_e}")
+                else:
+                    print(f"CodeConsumer: Temp file {self.temp_file_name} not found for unlinking after error.")
+                self.temp_file_name = None # Reset temp_file_name regardless of unlink success/failure
 
     async def handle_process_streams(self, process):
         # Function to handle input detection
         async def detect_input(line):
             if line == "__WAITING_FOR_INPUT__":
-                await self.send(json.dumps({'type': 'input_prompt'}))
+                await self._send_json_safe({'type': 'input_prompt'})
                 return True
 
             # Other common patterns
@@ -154,7 +158,7 @@ __builtins__['input'] = custom_input
 
             for pattern in input_patterns:
                 if re.search(pattern, line):
-                    await self.send(json.dumps({'type': 'input_prompt'}))
+                    await self._send_json_safe({'type': 'input_prompt'})
                     return True
             return False
 
@@ -171,15 +175,15 @@ __builtins__['input'] = custom_input
                     # Check if the line is asking for input
                     is_input = await detect_input(line_str)
                     if not is_input:
-                        await self.send(json.dumps({
+                        await self._send_json_safe({
                             'type': 'output',
                             'output': line_str
-                        }))
+                        })
                 except Exception as e:
-                    await self.send(json.dumps({
+                    await self._send_json_safe({
                         'type': 'error',
                         'error': f"Output reading error: {str(e)}"
-                    }))
+                    })
                     break
 
         # Process stderr
@@ -190,15 +194,15 @@ __builtins__['input'] = custom_input
                     if not line:
                         break
                     line_str = line.decode('utf-8', errors='replace').rstrip('\n')
-                    await self.send(json.dumps({
+                    await self._send_json_safe({
                         'type': 'error',
                         'error': line_str
-                    }))
+                    })
                 except Exception as e:
-                    await self.send(json.dumps({
+                    await self._send_json_safe({
                         'type': 'error',
                         'error': f"Error reading error: {str(e)}"
-                    }))
+                    })
                     break
 
         # Start reading in the background
@@ -217,10 +221,10 @@ __builtins__['input'] = custom_input
             if self.session_id in self.processes:
                 del self.processes[self.session_id]
 
-            await self.send(json.dumps({
+            await self._send_json_safe({
                 'type': 'execution_complete',
                 'exit_code': exit_code
-            }))
+            })
 
             # Clean up temp file
             if self.temp_file_name and os.path.exists(self.temp_file_name):
@@ -249,10 +253,10 @@ __builtins__['input'] = custom_input
                 process.stdin.write(f"{input_value}\n".encode())
                 await process.stdin.drain()
             except Exception as e:
-                await self.send(json.dumps({
+                await self._send_json_safe({
                     'type': 'error',
                     'error': f"Failed to send input: {str(e)}"
-                }))
+                })
 
     async def terminate_execution(self):
         if hasattr(self, 'session_id') and self.session_id in self.processes:
@@ -270,12 +274,19 @@ __builtins__['input'] = custom_input
                 # Remove from processes dict
                 del self.processes[self.session_id]
 
-                await self.send(json.dumps({
+                await self._send_json_safe({
                     'type': 'execution_terminated',
                     'message': 'Execution terminated'
-                }))
+                })
             except Exception as e:
-                await self.send(json.dumps({
+                await self._send_json_safe({
                     'type': 'error',
                     'error': f"Error terminating process: {str(e)}"
-                }))
+                })
+
+    async def _send_json_safe(self, data_dict):
+        try:
+            json_string = json.dumps(data_dict)
+            await self.send(text_data=json_string)
+        except Exception as e:
+            print(f"CodeConsumer: Failed to send message to client: {e}. Original data: {data_dict}")
