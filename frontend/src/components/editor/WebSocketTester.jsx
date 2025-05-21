@@ -126,8 +126,8 @@ const WebSocketTester = () => {
 
       <div className="mb-4 flex items-center">
         <div className={`h-3 w-3 rounded-full mr-2 ${
-          isConnected ? 'bg-green-500' : 
-          connectionStatus === 'connecting' ? 'bg-yellow-500' : 
+          isConnected ? 'bg-green-500' :
+          connectionStatus === 'connecting' ? 'bg-yellow-500' :
           connectionStatus === 'error' ? 'bg-red-500' : 'bg-gray-500'
         }`}></div>
         <span className="text-sm font-medium">Status: {connectionStatus}</span>
@@ -189,8 +189,6 @@ const WebSocketTester = () => {
             try {
               if (e.target.value) {
                 JSON.parse(e.target.value);
-                setJsonValid(true);
-              } else {
                 setJsonValid(true);
               }
             } catch {
