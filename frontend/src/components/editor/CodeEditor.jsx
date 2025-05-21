@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import Editor from '@monaco-editor/react';
 import { files as filesApi, projects as projectsApi } from '../../services/api';
+import codeExecutionService from '../../services/codeExecutionService';
 import Loader from '../ui/Loader';
 import Button from '../ui/Button';
 import FileExplorer from './FileExplorer';
@@ -19,6 +20,7 @@ const CodeEditor = () => {
   const [error, setError] = useState(null);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const editorRef = useRef(null);
+  const [connectionStatus, setConnectionStatus] = useState('disconnected');
 
   // Add these state variables for the empty state file creation
   const [showNewFileInput, setShowNewFileInput] = useState(false);
@@ -30,35 +32,22 @@ const CodeEditor = () => {
   const [userInput, setUserInput] = useState('');
   const [waitingForInput, setWaitingForInput] = useState(false);
   const terminalRef = useRef(null);
-  const socketRef = useRef(null);
-  const sessionIdRef = useRef(null);
   const inputRef = useRef(null);
-  const [socketReady, setSocketReady] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const connectionPromiseRef = useRef(null);
 
   // Fetch project and files
   useEffect(() => {
     const fetchProjectData = async () => {
       try {
-        setLoading(true);
-
-        // Fetch project details
         const projectResponse = await projectsApi.get(projectId);
         setProject(projectResponse.data);
 
-        // Fetch project files
         const filesResponse = await filesApi.getAll(projectId);
         setFiles(filesResponse.data);
 
-        // Select first file if any
-        if (filesResponse.data.length > 0) {
-          handleFileSelect(filesResponse.data[0]);
-        }
+        setLoading(false);
       } catch (err) {
-        console.error('Error fetching project data:', err);
-        setError('Failed to load project data');
-      } finally {
+        console.error('Failed to fetch project data:', err);
+        setError('Failed to load project. Please try again.');
         setLoading(false);
       }
     };
@@ -67,35 +56,91 @@ const CodeEditor = () => {
       fetchProjectData();
     }
 
+    // Check connection status periodically
+    const checkConnectionStatus = () => {
+      const isConnected = codeExecutionService.isConnected();
+      setConnectionStatus(isConnected ? 'connected' : 'disconnected');
+    };
+
+    // Check connection status immediately and set up interval
+    checkConnectionStatus();
+    const intervalId = setInterval(checkConnectionStatus, 3000);
+
+    // Register event handlers for the code execution service
+    codeExecutionService.on('output', handleOutput);
+    codeExecutionService.on('error', handleError);
+    codeExecutionService.on('inputPrompt', handleInputPrompt);
+    codeExecutionService.on('executionComplete', handleExecutionComplete);
+    codeExecutionService.on('executionTerminated', handleExecutionTerminated);
+    codeExecutionService.on('socketError', handleSocketError);
+    codeExecutionService.on('connectionEstablished', handleConnectionEstablished);
+
     // Add event listener for beforeunload
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
-      // Clean up when component unmounts
-      closeWebSocket();
+      // Clean up event handlers
+      codeExecutionService.off('output', handleOutput);
+      codeExecutionService.off('error', handleError);
+      codeExecutionService.off('inputPrompt', handleInputPrompt);
+      codeExecutionService.off('executionComplete', handleExecutionComplete);
+      codeExecutionService.off('executionTerminated', handleExecutionTerminated);
+      codeExecutionService.off('socketError', handleSocketError);
+      codeExecutionService.off('connectionEstablished', handleConnectionEstablished);
+
+      // Clean up interval
+      clearInterval(intervalId);
+
+      // Close WebSocket connection
+      codeExecutionService.closeConnection();
       window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [projectId]);
 
   const handleBeforeUnload = () => {
-    closeWebSocket();
+    codeExecutionService.closeConnection();
   };
 
-  // Properly close the WebSocket connection
-  const closeWebSocket = () => {
-    if (socketRef.current && socketRef.current.readyState !== WebSocket.CLOSED) {
-      try {
-        socketRef.current.close();
-      } catch (e) {
-        console.error('Error closing WebSocket:', e);
-      }
-      socketRef.current = null;
+  // Event handlers for code execution service
+  const handleOutput = (output) => {
+    addTerminalOutput(output);
+  };
+
+  const handleError = (error) => {
+    addTerminalOutput(error, 'error');
+  };
+
+  const handleInputPrompt = () => {
+    setWaitingForInput(true);
+    if (inputRef.current) {
+      inputRef.current.focus();
     }
+  };
+
+  const handleExecutionComplete = (exitCode) => {
+    addTerminalOutput(`\nExecution completed with exit code ${exitCode}`, 'system');
     setIsRunning(false);
-    setWaitingForInput(false);
-    setSocketReady(false);
-    setIsConnecting(false);
-    connectionPromiseRef.current = null;
+  };
+
+  const handleExecutionTerminated = (message) => {
+    addTerminalOutput(`\n${message || 'Execution terminated'}`, 'system');
+    setIsRunning(false);
+  };
+
+  const handleSocketError = (error) => {
+    console.error('Socket error:', error);
+    setError(`Connection error: ${error}`);
+    setConnectionStatus('error');
+    if (isRunning) {
+      setIsRunning(false);
+      addTerminalOutput('Execution interrupted due to connection error', 'error');
+    }
+  };
+
+  const handleConnectionEstablished = () => {
+    setConnectionStatus('connected');
+    addTerminalOutput('Connected to code execution service', 'system');
+    setError(null);
   };
 
   // Auto-scroll terminal to bottom
@@ -115,17 +160,11 @@ const CodeEditor = () => {
   const fetchFileContent = async (fileId) => {
     try {
       const response = await filesApi.getContent(fileId);
-      const content = response.data.content || '';
-
-      // Update our files state with the content
-      setFiles(files.map(f =>
-        f.id === fileId ? { ...f, content } : f
-      ));
-
-      return content;
+      return response.data.content;
     } catch (err) {
-      console.error(`Error fetching file content for file ${fileId}:`, err);
-      throw err;
+      console.error('Failed to fetch file content:', err);
+      setError('Failed to load file content. Please try again.');
+      return null;
     }
   };
 
@@ -150,9 +189,14 @@ const CodeEditor = () => {
     else {
       try {
         const content = await fetchFileContent(file.id);
-        setFileContent(content);
-      } catch (err) {
-        setError(`Failed to load file: ${err.message}`);
+        setFileContent(content || '');
+
+        // Update the content in our files state
+        setFiles(files.map(f =>
+          f.id === file.id ? { ...f, content } : f
+        ));
+      } catch (error) {
+        console.error('Error fetching file content:', error);
       }
     }
   };
@@ -166,7 +210,7 @@ const CodeEditor = () => {
     if (activeFile) {
       // Update file content in state
       setFiles(files.map(f =>
-        f.id === activeFile.id ? { ...f, content: value || '' } : f
+        f.id === activeFile.id ? { ...f, content: value } : f
       ));
     }
   };
@@ -176,130 +220,20 @@ const CodeEditor = () => {
 
     try {
       setSaving(true);
-      await filesApi.updateContent(activeFile.id, { content: fileContent });
+      const response = await filesApi.updateContent(activeFile.id, { content: fileContent });
+
+      // Update the content in our files state
+      setFiles(files.map(f =>
+        f.id === activeFile.id ? { ...f, content: fileContent } : f
+      ));
+
+      // Optionally show a success notification
     } catch (err) {
-      setError(`Failed to save file: ${err.message}`);
+      console.error('Failed to save file:', err);
+      setError('Failed to save file. Please try again.');
     } finally {
       setSaving(false);
     }
-  };
-
-  const setupWebSocket = () => {
-    // If we already have a connection promise, return it
-    if (connectionPromiseRef.current) {
-      return connectionPromiseRef.current;
-    }
-
-    // Create a new connection promise
-    const connectionPromise = new Promise((resolve, reject) => {
-      // Close existing socket if any
-      if (socketRef.current) {
-        try {
-          socketRef.current.close();
-          socketRef.current = null;
-        } catch (e) {
-          console.error('Error closing existing WebSocket:', e);
-        }
-      }
-
-      setIsConnecting(true);
-      setSocketReady(false);
-
-      // Generate a unique session ID
-      sessionIdRef.current = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-
-      console.log("Setting up new WebSocket connection with session ID:", sessionIdRef.current);
-
-      // Create new WebSocket connection
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsHost = window.location.hostname === 'localhost' ? 'localhost:8000' : window.location.host;
-      const socket = new WebSocket(`${wsProtocol}//${wsHost}/ws/code/${sessionIdRef.current}/`);
-
-      // Add connection timeout
-      const connectionTimeout = setTimeout(() => {
-        if (socket.readyState !== WebSocket.OPEN) {
-          reject(new Error("WebSocket connection timeout"));
-          socket.close();
-          connectionPromiseRef.current = null;
-        }
-      }, 5000); // 5 second timeout
-
-      socket.onopen = () => {
-        console.log('WebSocket connection established');
-        addTerminalOutput('Connected to code execution service', 'system');
-        // Wait for the connection_established message from the server before resolving
-      };
-
-      socket.onmessage = (event) => {
-        try {
-          console.log('Received:', event.data);
-          const data = JSON.parse(event.data);
-
-          if (data.type === 'connection_established') {
-            console.log('Connection confirmed by server');
-            clearTimeout(connectionTimeout);
-            setSocketReady(true);
-            setIsConnecting(false);
-            resolve(socket); // Resolve only after server confirms connection
-          } else if (data.type === 'output') {
-            addTerminalOutput(data.output);
-          } else if (data.type === 'error') {
-            addTerminalOutput(data.error, 'error');
-          } else if (data.type === 'input_prompt') {
-            setWaitingForInput(true);
-          } else if (data.type === 'execution_complete') {
-            addTerminalOutput(`\nExecution completed with exit code ${data.exit_code}`, 'system');
-            setIsRunning(false);
-          } else if (data.type === 'execution_terminated') {
-            addTerminalOutput('\nExecution terminated', 'system');
-            setIsRunning(false);
-          }
-        } catch (error) {
-          console.error('Error handling message:', error);
-          addTerminalOutput('Error handling message from server', 'error');
-        }
-      };
-
-      socket.onclose = (event) => {
-        console.log('WebSocket connection closed', event);
-        clearTimeout(connectionTimeout);
-
-        // If we're still trying to establish connection, reject the promise
-        if (isConnecting && connectionPromiseRef.current === connectionPromise) {
-          reject(new Error("WebSocket connection closed during connection attempt"));
-        }
-
-        if (isRunning) {
-          addTerminalOutput('Connection to execution service closed unexpectedly', 'error');
-          setError('Connection to execution service closed unexpectedly');
-        }
-
-        setIsRunning(false);
-        setWaitingForInput(false);
-        setSocketReady(false);
-        setIsConnecting(false);
-        socketRef.current = null;
-        connectionPromiseRef.current = null;
-      };
-
-      socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        addTerminalOutput('Error connecting to execution service', 'error');
-        setError('WebSocket connection error');
-        setIsRunning(false);
-        setSocketReady(false);
-        setIsConnecting(false);
-        clearTimeout(connectionTimeout);
-        reject(error);
-        connectionPromiseRef.current = null;
-      };
-
-      socketRef.current = socket;
-    });
-
-    // Store the promise for reuse
-    connectionPromiseRef.current = connectionPromise;
-    return connectionPromise;
   };
 
   const addTerminalOutput = (text, type = 'output') => {
@@ -307,37 +241,46 @@ const CodeEditor = () => {
   };
 
   const handleRunCode = async () => {
-    if (!activeFile) return;
+  if (!activeFile) return;
 
-    try {
-      clearTerminal();
-      setIsRunning(true);
-      setError(null);
-      setWaitingForInput(false);
+  try {
+    // Clear previous output and set running state
+    setTerminalOutput([]);
+    setIsRunning(true);
+    setError(null);
 
-      // Setup WebSocket and wait for it to be fully connected
-      const socket = await setupWebSocket();
+    // If not connected, set up the WebSocket first
+    if (!codeExecutionService.isConnected()) {
+      addTerminalOutput('Establishing connection...', 'system');
+      codeExecutionService.setupWebSocket();
 
-      // Now that the socket is ready, send the code
-      addTerminalOutput(`Running ${activeFile.name}...`, 'system');
+      // Give it a moment to connect before executing
+      await new Promise(resolve => setTimeout(resolve, 500));
 
-      // Get the programming language based on file extension
-      const language = getLanguage(activeFile.name);
-
-      // Send the code to be executed
-      socket.send(JSON.stringify({
-        type: 'execute',
-        code: fileContent,
-        language: language,
-        file_id: activeFile.id
-      }));
-    } catch (error) {
-      console.error('Error running code:', error);
-      setError(`Error connecting to execution service: ${error.message}`);
-      setIsRunning(false);
-      closeWebSocket(); // Clean up the socket on error
+      // If still not connected after waiting, show an error
+      if (!codeExecutionService.isConnected()) {
+        throw new Error('Failed to establish connection');
+      }
     }
-  };
+
+    addTerminalOutput(`Running ${activeFile.name}...`, 'system');
+
+    // Extract the language from the file extension
+    const language = getLanguage(activeFile.name);
+
+    // Execute the code
+    await codeExecutionService.executeCode(
+      fileContent,
+      language === 'javascript' ? 'js' : language,
+      activeFile.id
+    );
+  } catch (error) {
+    console.error('Error running code:', error);
+    setError(`Error running code: ${error.message}`);
+    addTerminalOutput(`Error running code: ${error.message}`, 'error');
+    setIsRunning(false);
+  }
+};
 
   const handleInputKeyDown = (e) => {
     if (e.key === 'Enter' && waitingForInput) {
@@ -347,18 +290,16 @@ const CodeEditor = () => {
   };
 
   const sendInput = () => {
-    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
+    if (!codeExecutionService.isConnected()) {
+      addTerminalOutput('Connection lost. Cannot send input.', 'error');
       return;
     }
 
     // Add the input to terminal with a visual indicator
     addTerminalOutput(`> ${userInput}`, 'input');
 
-    // Send to WebSocket
-    socketRef.current.send(JSON.stringify({
-      type: 'input',
-      input: userInput
-    }));
+    // Send to WebSocket using the service
+    codeExecutionService.sendInput(userInput);
 
     // Reset input field and wait state
     setUserInput('');
@@ -366,13 +307,28 @@ const CodeEditor = () => {
   };
 
   const stopExecution = () => {
-    if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-      socketRef.current.send(JSON.stringify({
-        type: 'terminate'
-      }));
-
-      addTerminalOutput('Terminating execution...', 'system');
+    if (!codeExecutionService.isConnected()) {
+      addTerminalOutput('Connection lost. Cannot stop execution.', 'error');
+      setIsRunning(false);
+      return;
     }
+
+    codeExecutionService.terminateExecution();
+    addTerminalOutput('Terminating execution...', 'system');
+  };
+
+  const reconnectToService = () => {
+    addTerminalOutput('Attempting to reconnect...', 'system');
+    setConnectionStatus('connecting');
+
+    // Use setupWebSocket instead of connect (which doesn't exist)
+    const socket = codeExecutionService.setupWebSocket();
+
+    // Handle potential immediate connection errors
+    socket.onerror = () => {
+      setConnectionStatus('error');
+      addTerminalOutput('Failed to reconnect. Please try again later.', 'error');
+    };
   };
 
   const handleCreateFile = async (fileName) => {
@@ -380,47 +336,56 @@ const CodeEditor = () => {
       const response = await filesApi.create({
         name: fileName,
         project: projectId,
+        content: ''
       });
-
       setFiles([...files, response.data]);
       handleFileSelect(response.data);
     } catch (err) {
-      setError(`Failed to create file: ${err.message}`);
+      console.error('Failed to create file:', err);
+      setError('Failed to create file. Please try again.');
     }
   };
 
   const handleRenameFile = async (fileId, newName) => {
-    try {
-      const fileToUpdate = files.find(f => f.id === fileId);
-      if (!fileToUpdate) return;
+  try {
+    // First get the current file to ensure we have all required fields
+    const currentFile = files.find(f => f.id === fileId);
+    if (!currentFile) return;
 
-      const response = await filesApi.update(fileId, {
-        name: newName,
-        project: projectId,
-      });
+    // Update with proper structure matching API expectations
+    await filesApi.update(fileId, {
+      name: newName,
+      project: projectId
+    });
 
-      setFiles(files.map(f => f.id === fileId ? response.data : f));
+    // Update files in state
+    setFiles(files.map(f =>
+      f.id === fileId ? { ...f, name: newName } : f
+    ));
 
-      if (activeFile && activeFile.id === fileId) {
-        setActiveFile(response.data);
-      }
-    } catch (err) {
-      setError(`Failed to rename file: ${err.message}`);
+    // Update active file if it was the one renamed
+    if (activeFile && activeFile.id === fileId) {
+      setActiveFile({ ...activeFile, name: newName });
     }
-  };
+  } catch (err) {
+    console.error('Failed to rename file:', err);
+    setError(`Failed to rename file: ${err.message}`);
+  }
+};
+
 
   const handleDeleteFile = async (fileId) => {
     try {
       await filesApi.delete(fileId);
-
       setFiles(files.filter(f => f.id !== fileId));
 
-      if (activeFile && activeFile.id === fileId) {
+      if (activeFile?.id === fileId) {
         setActiveFile(null);
         setFileContent('');
       }
     } catch (err) {
-      setError(`Failed to delete file: ${err.message}`);
+      console.error('Failed to delete file:', err);
+      setError('Failed to delete file. Please try again.');
     }
   };
 
@@ -458,10 +423,20 @@ const CodeEditor = () => {
     navigate('/settings');
   };
 
+  const getConnectionStatusText = () => {
+    switch (connectionStatus) {
+      case 'connected': return isRunning ? 'Running...' : 'Terminal';
+      case 'connecting': return 'Connecting...';
+      case 'error': return 'Connection error';
+      case 'disconnected': return 'Disconnected';
+      default: return 'Terminal';
+    }
+  };
+
   if (loading && !project) {
     return (
       <div className="flex items-center justify-center h-screen">
-        <Loader size="lg" />
+        <Loader />
       </div>
     );
   }
@@ -476,43 +451,22 @@ const CodeEditor = () => {
       <div className="bg-gray-800 text-white p-2 flex justify-between items-center shadow-md">
         <div className="flex items-center">
           <button
-            className="p-1 mr-2 rounded hover:bg-gray-700"
+            className="p-1 mr-2 text-white hover:bg-gray-700 rounded"
             onClick={() => setSidebarOpen(!sidebarOpen)}
-            title={sidebarOpen ? "Hide sidebar" : "Show sidebar"}
           >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 6h16M4 12h16M4 18h16"></path>
-            </svg>
+            ☰
           </button>
-          <h1 className="text-lg font-semibold">
-            {project?.name || 'Code Editor'}
-          </h1>
+          <h1 className="text-xl font-bold">{project?.name || 'Code Editor'}</h1>
         </div>
-
-        <div className="flex items-center space-x-2">
+        <div className="flex space-x-2">
           <Button
-            variant="secondary"
-            size="sm"
-            onClick={handleSave}
-            disabled={!activeFile || saving}
-          >
-            {saving ? 'Saving...' : 'Save'}
-          </Button>
-
-          <Button
-            variant="primary"
-            size="sm"
             onClick={handleRunCode}
+            variant="primary"
             disabled={!activeFile || isRunning}
           >
             {isRunning ? 'Running...' : 'Run'}
           </Button>
-
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={goToSettings}
-          >
+          <Button onClick={goToSettings} variant="ghost">
             Settings
           </Button>
         </div>
@@ -522,7 +476,7 @@ const CodeEditor = () => {
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
         {sidebarOpen && (
-          <div className="w-64 bg-gray-100 border-r">
+          <div className="w-64 border-r bg-gray-50 flex-shrink-0 overflow-hidden flex flex-col">
             <FileExplorer
               files={files}
               activeFileId={activeFile?.id}
@@ -540,21 +494,17 @@ const CodeEditor = () => {
           {activeFile ? (
             <>
               <FileOperationsBar
-                file={activeFile}
+                activeFile={activeFile}
                 onSave={handleSave}
-                onRun={handleRunCode}
-                saving={saving}
-                running={isRunning}
               />
-
-              <div className="flex-1">
+              <div className="flex-1 overflow-hidden">
                 <Editor
                   height="100%"
                   language={getLanguage(activeFile.name)}
                   value={fileContent}
+                  theme="vs-dark"
                   onChange={handleContentChange}
                   onMount={handleEditorDidMount}
-                  theme="vs-dark"
                   options={{
                     minimap: { enabled: false },
                     fontSize: 14,
@@ -565,102 +515,100 @@ const CodeEditor = () => {
               </div>
             </>
           ) : (
-            <div className="flex-1 flex items-center justify-center text-gray-500">
-              {files.length > 0 ? (
-                <div className="text-center">
-                  <p>Select a file from the sidebar to edit</p>
-                </div>
-              ) : (
-                <div className="text-center">
-                  <p>No files in this project yet</p>
+            <div className="flex-1 flex items-center justify-center bg-gray-100">
+              <div className="text-center p-6 max-w-md">
+                <h2 className="text-2xl font-bold mb-4">No file selected</h2>
+                <p className="mb-4 text-gray-600">
+                  Select a file from the sidebar or create a new one to start coding.
+                </p>
+                <div className="flex justify-center">
                   <Button
-                    variant="primary"
-                    size="sm"
-                    className="mt-4"
                     onClick={() => setShowNewFileInput(true)}
+                    variant="primary"
                   >
-                    Create a file
+                    Create New File
                   </Button>
+                </div>
 
-                  {showNewFileInput && (
-                    <div className="mt-4">
-                      <input
-                        type="text"
-                        value={newFileName}
-                        onChange={(e) => setNewFileName(e.target.value)}
-                        placeholder="File name (e.g. main.py)"
-                        className="px-2 py-1 border rounded text-sm"
-                        autoFocus
-                      />
+                {showNewFileInput && (
+                  <div className="mt-4">
+                    <input
+                      type="text"
+                      className="border p-2 w-full mb-2 rounded"
+                      placeholder="Enter file name"
+                      value={newFileName}
+                      onChange={(e) => setNewFileName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          handleCreateFile(newFileName);
+                          setNewFileName('');
+                          setShowNewFileInput(false);
+                        }
+                      }}
+                      autoFocus
+                    />
+                    <div className="flex space-x-2">
                       <Button
-                        variant="secondary"
-                        size="sm"
-                        className="ml-2"
                         onClick={() => {
-                          if (newFileName.trim()) {
-                            handleCreateFile(newFileName);
-                            setShowNewFileInput(false);
-                            setNewFileName('');
-                          }
+                          handleCreateFile(newFileName);
+                          setNewFileName('');
+                          setShowNewFileInput(false);
                         }}
+                        disabled={!newFileName.trim()}
+                        variant="primary"
+                        size="sm"
                       >
                         Create
                       </Button>
+                      <Button
+                        onClick={() => {
+                          setNewFileName('');
+                          setShowNewFileInput(false);
+                        }}
+                        variant="ghost"
+                        size="sm"
+                      >
+                        Cancel
+                      </Button>
                     </div>
-                  )}
-                </div>
-              )}
+                  </div>
+                )}
+              </div>
             </div>
           )}
 
           {/* Terminal - Always visible now */}
           <div className="terminal-panel">
             <div className="terminal-toolbar">
-              <div className="terminal-status">
-                {isConnecting ? 'Connecting...' : isRunning ? 'Running...' : 'Terminal'}
+              <div className={`terminal-status terminal-status-${connectionStatus}`}>
+                {getConnectionStatusText()}
+                {connectionStatus !== 'connected' && (
+                  <button
+                    onClick={reconnectToService}
+                    className="ml-2 text-xs bg-blue-500 px-1 rounded hover:bg-blue-600"
+                    title="Reconnect to execution service"
+                  >
+                    Reconnect
+                  </button>
+                )}
               </div>
               <div>
-                <button
-                  onClick={clearTerminal}
-                  title="Clear terminal"
-                  className="terminal-btn"
-                >
-                  <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-                    <line x1="9" y1="3" x2="9" y2="21"></line>
-                  </svg>
-                </button>
                 {isRunning && (
                   <button
                     onClick={stopExecution}
+                    className="terminal-toolbar-button text-red-400"
                     title="Stop execution"
-                    className="terminal-btn terminal-btn-stop"
                   >
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      width="16"
-                      height="16"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      strokeWidth="2"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    >
-                      <rect x="6" y="6" width="12" height="12"></rect>
-                    </svg>
+                    Stop
                   </button>
                 )}
+                <button
+                  onClick={clearTerminal}
+                  className="terminal-toolbar-button"
+                  title="Clear terminal"
+                >
+                  Clear
+                </button>
               </div>
             </div>
 
@@ -668,7 +616,7 @@ const CodeEditor = () => {
               {terminalOutput.map((line, i) => (
                 <p
                   key={i}
-                  className={`terminal-line terminal-${line.type}`}
+                  className={`terminal-line terminal-line-${line.type}`}
                 >
                   {line.text}
                 </p>
@@ -686,7 +634,7 @@ const CodeEditor = () => {
                   value={userInput}
                   onChange={(e) => setUserInput(e.target.value)}
                   onKeyDown={handleInputKeyDown}
-                  disabled={!waitingForInput}
+                  disabled={!waitingForInput || connectionStatus !== 'connected'}
                   className="terminal-input"
                   autoComplete="off"
                   autoCorrect="off"
