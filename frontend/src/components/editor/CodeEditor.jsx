@@ -307,14 +307,28 @@ const CodeEditor = () => {
   };
 
   const handleRunCode = async () => {
-    if (!activeFile) return;
+    if (!activeFile || !activeFile.id) {
+      console.warn("handleRunCode: Aborted due to missing activeFile or activeFile.id");
+      return;
+    }
+
+    const MAX_FILE_SIZE_BYTES = 1 * 1024 * 1024; // 1MB
+    // Estimate byte size using string length (UTF-8 can be larger, but this is a common proxy)
+    if (fileContent.length > MAX_FILE_SIZE_BYTES) { 
+      const errorMsg = `File is too large to execute (approx > ${MAX_FILE_SIZE_BYTES / 1024 / 1024}MB).`;
+      console.error(errorMsg);
+      setError(errorMsg);
+      addTerminalOutput(errorMsg, 'error');
+      setIsRunning(false); // Ensure isRunning is reset if it was set before this check
+      return;
+    }
+
+    clearTerminal();
+    setIsRunning(true); 
+    setError(null);     
+    setWaitingForInput(false);
 
     try {
-      clearTerminal();
-      setIsRunning(true);
-      setError(null);
-      setWaitingForInput(false);
-
       // Setup WebSocket and wait for it to be fully connected
       const socket = await setupWebSocket();
 
@@ -325,12 +339,14 @@ const CodeEditor = () => {
       const language = getLanguage(activeFile.name);
 
       // Send the code to be executed
-      socket.send(JSON.stringify({
+      const payload = {
         type: 'execute',
         code: fileContent,
         language: language,
         file_id: activeFile.id
-      }));
+      };
+      console.log('Sending execute message with payload:', JSON.stringify(payload));
+      socket.send(JSON.stringify(payload));
     } catch (error) {
       console.error('Error running code:', error);
       setError(`Error connecting to execution service: ${error.message}`);
